@@ -1,0 +1,348 @@
+#include <TinyGPS++.h> 
+#include <ArduinoJson.h>
+
+#define GSM_PORT Serial3  
+#define GPS_PORT Serial2
+
+#define DEBUG_SERIAL 
+
+TinyGPSPlus gps;
+
+double hour, minute, second, month, day, year;
+double Latitudee,Longitudee,Altitudee,Speede;
+String Coursee;
+int Houre, Minutee, Seconde;
+
+enum _parseState {
+  PS_DETECT_MSG_TYPE,
+
+  PS_IGNORING_COMMAND_ECHO,
+
+  PS_HTTPACTION_TYPE,
+  PS_HTTPACTION_RESULT,
+  PS_HTTPACTION_LENGTH,
+
+  PS_HTTPREAD_LENGTH,
+  PS_HTTPREAD_CONTENT
+};
+
+enum _actionState {
+  AS_IDLE,
+  AS_WAITING_FOR_RESPONSE
+};
+
+byte actionState = AS_IDLE;
+unsigned long lastActionTime = 0;
+
+byte parseState = PS_DETECT_MSG_TYPE;
+char buffer[80];
+byte pos = 0;
+
+int httpResult = 0;   
+int contentLength = 0;
+
+
+void resetBuffer() {
+  memset(buffer, 0, sizeof(buffer));
+  pos = 0;
+}
+
+void sendGSM(const char* msg, int waitMs = 500) {   // to give instruction to gsm 
+  GSM_PORT.println(msg);
+  while(GSM_PORT.available()) {
+    parseATText(GSM_PORT.read());
+  }
+  delay(waitMs);
+}
+
+void dropGSM(unsigned long now) {  
+  while(GSM_PORT.available()) {
+    lastActionTime = now;
+    parseATText(GSM_PORT.read());
+  }
+}
+
+
+void parseATText(byte b) {
+
+#ifdef DEBUG_SERIAL
+  Serial.write(b);
+#endif
+
+  buffer[pos++] = b;
+
+  if ( pos >= sizeof(buffer) ) 
+    resetBuffer(); 
+  
+    #ifdef DEBUG_SERIAL
+   #endif
+
+  switch (parseState) {
+  case PS_DETECT_MSG_TYPE: 
+    {
+      if ( b == '\n' )
+        resetBuffer();
+      else {        
+        if ( pos == 3 && strcmp(buffer, "AT+") == 0 ) {
+          parseState = PS_IGNORING_COMMAND_ECHO;
+        }
+        else if ( b == ':' ) {
+#ifdef DEBUG_SERIAL
+          Serial.print("Checking message type: ");
+          Serial.println(buffer);
+#endif
+
+          if ( strcmp(buffer, "+HTTPACTION:") == 0 ) {
+#ifdef DEBUG_SERIAL
+            Serial.println("Received HTTPACTION");
+#endif
+            parseState = PS_HTTPACTION_TYPE;
+          }
+          else if ( strcmp(buffer, "+HTTPREAD:") == 0 ) {
+#ifdef DEBUG_SERIAL
+            Serial.println("Received HTTPREAD"); 
+#endif           
+            parseState = PS_HTTPREAD_LENGTH;
+          }
+          resetBuffer();
+        }
+      }
+    }
+    break;
+
+  case PS_IGNORING_COMMAND_ECHO:
+    {
+      if ( b == '\n' ) {
+#ifdef DEBUG_SERIAL
+        Serial.print("Ignoring echo: ");
+        Serial.println(buffer);
+#endif
+        parseState = PS_DETECT_MSG_TYPE;
+        resetBuffer();
+      }
+    }
+    break;
+
+  case PS_HTTPACTION_TYPE:
+    {
+      if ( b == ',' ) {
+#ifdef DEBUG_SERIAL
+        Serial.print("HTTPACTION type is ");
+        Serial.println(buffer);
+#endif
+        parseState = PS_HTTPACTION_RESULT;
+        resetBuffer();
+      }
+    }
+    break;
+
+  case PS_HTTPACTION_RESULT:
+    {
+      if ( b == ',' ) {
+#ifdef DEBUG_SERIAL
+        Serial.print("HTTPACTION result is ");
+        Serial.println(buffer);
+#endif
+        httpResult = atoi(buffer);
+        parseState = PS_HTTPACTION_LENGTH;
+        resetBuffer();
+      }
+    }
+    break;
+
+  case PS_HTTPACTION_LENGTH:
+    {
+      if ( b == '\n' ) {
+        
+#ifdef DEBUG_SERIAL
+        Serial.print("HTTPACTION length is ");
+        Serial.println(buffer);
+#endif
+
+        contentLength = atoi(buffer);
+        // now request content
+        if ( contentLength > 0 ) {
+          GSM_PORT.print("AT+HTTPREAD=0,");
+          GSM_PORT.println(buffer);
+        }
+        else
+          actionState = AS_IDLE;
+        parseState = PS_DETECT_MSG_TYPE;
+        resetBuffer();
+      }
+    }
+    break;
+
+  case PS_HTTPREAD_LENGTH:
+    {
+      if ( b == '\n' ) {
+        contentLength = atoi(buffer);
+#ifdef DEBUG_SERIAL
+        Serial.print("HTTPREAD length is ");
+        Serial.println(contentLength);
+
+        Serial.print("HTTPREAD content: ");
+#endif
+
+        parseState = PS_HTTPREAD_CONTENT;
+        resetBuffer();
+      }
+    }
+    break;
+
+  case PS_HTTPREAD_CONTENT:
+    {
+
+#ifdef DEBUG_SERIAL
+      Serial.write(b);
+#endif
+
+      contentLength--;
+
+      if ( contentLength <= 0 ) {
+
+        // all content bytes have now been read
+
+        parseState = PS_DETECT_MSG_TYPE;
+        resetBuffer();
+
+#ifdef DEBUG_SERIAL
+        Serial.print("\n\n\n\n");
+#endif
+
+        actionState = AS_IDLE;
+      }
+    }
+    break;
+  }
+}
+
+void setup()
+{
+  GSM_PORT.begin(9600);
+  GPS_PORT.begin(9600);
+#ifdef DEBUG_SERIAL
+  Serial.begin(9600);
+#endif
+
+  sendGSM("AT+SAPBR=3,1,\"APN\",\"digi\""); 
+  sendGSM("AT+SAPBR=1,1",3000);
+  sendGSM("AT+HTTPINIT");
+  sendGSM("AT+HTTPPARA=\"CID\",1");
+}
+
+void loop()
+{ 
+  unsigned long now = millis();
+
+   while (GPS_PORT.available() > 0)
+    if (gps.encode(GPS_PORT.read()))
+      GPSInfo(Latitudee,Longitudee,Altitudee, Speede, Coursee, Houre, Minutee, Seconde);
+       
+  if (now > 5000 && gps.charsProcessed() < 10)
+  {
+    #ifdef DEBUG_SERIAL
+    Serial.println("No GPS detected");
+    #endif
+    while(true);
+  }
+
+  if ( actionState == AS_IDLE ) {
+    if ( now > lastActionTime + 30000 ) {
+
+      DynamicJsonDocument object(1024);
+      
+      object["latitude"] = Latitudee;
+      object["longitude"] = Longitudee;
+      object["altitude"] = Altitudee;
+      object["speed"] = Speede;
+      object["course"] = Coursee;
+      object["hour"] = Houre;
+      object["minute"] = Minutee;
+      object["second"] = Seconde;
+      
+      serializeJson(object, Serial);
+      String sendtoserver;
+      serializeJsonPretty(object, sendtoserver);
+      
+      delay(1000);
+
+      if(Latitudee == 0 )
+      {}
+      else
+      {
+      GSM_PORT.println("AT+HTTPPARA=\"URL\",\"http://demo.thingsboard.io/api/v1/862118026549193/telemetry\"");
+      delay(1000);
+      dropGSM(now);
+
+      GSM_PORT.println("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+      delay(1000);
+      dropGSM(now);
+
+      GSM_PORT.println("AT+HTTPDATA=" + String(sendtoserver.length()) + ",100000");
+      #ifdef DEBUG_SERIAL
+      Serial.println(sendtoserver);
+      #endif
+      
+      delay(1000);
+      dropGSM(now);
+     
+      GSM_PORT.println(sendtoserver);
+      delay(1000);
+      dropGSM(now);
+      
+      GSM_PORT.println("AT+HTTPACTION=1");
+      delay(1000);
+      dropGSM(now);
+     
+      GSM_PORT.println("AT+HTTPREAD");
+      delay(1000);
+      dropGSM(now);
+     }
+          
+      delay(1500);
+      lastActionTime = now;
+      httpResult = 0;
+      actionState = AS_WAITING_FOR_RESPONSE;
+      
+    }
+  }
+  else 
+  {
+    if ( now > lastActionTime + 15000 ) 
+    {
+      actionState = AS_IDLE;
+      parseState = PS_DETECT_MSG_TYPE;
+      resetBuffer();
+    }
+  }
+  dropGSM(now);
+}
+
+void GPSInfo(double &Latitude, double &Longitude, double &Altitude, double &Speed, String &Course, int &Hour, int &Minute, int &Second)
+{
+  if (gps.location.isValid())
+  {
+    Latitude = gps.location.lat(), 4 ;
+    Longitude = gps.location.lng(), 4 ;
+  }
+  if (gps.time.isValid())
+  {
+    Hour = gps.time.hour()+8;
+    if(Hour>23)
+    {
+      Hour-=24;
+    }
+    Minute = gps.time.minute();
+    Second = gps.time.second();
+  }
+  if (gps.altitude.isValid())
+  {
+    Altitude = gps.altitude.meters();
+  }
+  if (gps.speed.isValid())
+  {
+    Speed = gps.speed.kmph();
+  }
+  delay(1000);
+}
